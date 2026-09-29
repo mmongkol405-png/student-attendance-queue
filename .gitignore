@@ -1,0 +1,19 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite Database & WAL files (generated locally)
+*.db
+*.db-wal
+*.db-shm
+
+# Environment & local credentials
+.env
+venv/
+.venv/
+env/
+
+# IDE / Editor configuration
+.vscode/
+.idea/
