@@ -125,6 +125,44 @@ def wake_up_server(
     return False
 
 
+def shut_down_server(
+    base_url: str = DEFAULT_BASE_URL,
+    timeout_seconds: float = 10.0,
+    silent: bool = False,
+) -> bool:
+    """
+    Shuts down the server and queue infrastructure via /api/shutdown.
+    """
+    shutdown_url = f"{base_url.rstrip('/')}/api/shutdown"
+    wake_url = f"{base_url.rstrip('/')}/api/wakeup"
+    if not silent:
+        print(f"\n>> [TURNING OFF] Sending shutdown signal to {shutdown_url}...")
+    try:
+        with httpx.Client(timeout=4.0) as client:
+            client.post(shutdown_url)
+    except Exception:
+        pass
+
+    # Wait until offline
+    start_time = time.time()
+    while (time.time() - start_time) < timeout_seconds:
+        try:
+            with httpx.Client(timeout=1.5) as client:
+                res = client.get(wake_url)
+                if res.status_code != 200:
+                    break
+        except Exception:
+            # Connection refused means server is completely down!
+            if not silent:
+                print(f"  [SUCCESS] All services turned off and offline after {time.time() - start_time:.1f}s.")
+            return True
+        time.sleep(0.5)
+
+    if not silent:
+        print("  [SUCCESS] Services shut down.")
+    return True
+
+
 def trigger_scheduled_action(action: str = "start-sim", speed: float = 60.0, start_sim_url: str = DEFAULT_START_SIM_URL):
     """Trigger real action on the testing ground when the cron target time arrives."""
     if action == "start-sim":
@@ -326,8 +364,196 @@ def wait_until_target_time(
         print("\n[CRON SCHEDULER] Scheduled cron cancelled by user.")
 
 
+def run_wake_queue_cycle(
+    target_dt: Optional[datetime] = None,
+    run_duration_sec: float = 120.0,
+    sleep_duration_sec: float = 180.0,
+    speed: float = 60.0,
+    max_cycles: Optional[int] = None,
+    base_url: str = DEFAULT_BASE_URL,
+    stats_url: str = DEFAULT_STATS_URL,
+    sim_url: str = DEFAULT_SIM_STATUS_URL,
+    queue_url: str = DEFAULT_QUEUE_STATUS_URL,
+    wake_url: str = DEFAULT_WAKE_URL,
+    start_sim_url: str = DEFAULT_START_SIM_URL,
+    auto_start_local: bool = True,
+):
+    """
+    Executes automated Wake -> Run Queue (2 min) -> Turn Off -> Sleep (3 min) -> Repeat cycle.
+    1. If target_dt is specified, counts down until that scheduled real-world start time.
+    2. Wakes up the web server and queue infrastructure (auto-booting run_all.py if offline).
+    3. Runs the Cloud Tasks queue & attendance simulation for run_duration_sec (default 120s / 2 min).
+    4. Turns off the web server and queue workers.
+    5. Enters sleep/cooldown for sleep_duration_sec (default 180s / 3 min) with live countdown.
+    6. Repeats the cycle continuously (or for max_cycles).
+    """
+    print("\n" + "=" * 76)
+    print("   AUTOMATED WAKE-UP -> RUN QUEUE (2 MIN) -> SHUTDOWN -> SLEEP (3 MIN) CYCLE")
+    print("=" * 76)
+    print(f"  - Run Duration (Queue Active):    {run_duration_sec:.0f}s ({run_duration_sec / 60:.1f} min)")
+    print(f"  - Sleep Duration (Services Off):  {sleep_duration_sec:.0f}s ({sleep_duration_sec / 60:.1f} min)")
+    print(f"  - Simulation Speed:               {speed}x (7200s session compressed to {7200 / speed:.0f}s)")
+    if target_dt:
+        print(f"  - Scheduled Start Time:           {target_dt.strftime('%I:%M:%S %p (%H:%M:%S)')}")
+    else:
+        print("  - Scheduled Start Time:           Immediate (Cycle #1 begins now)")
+    print("=" * 76)
+
+    # If scheduled for a specific time, wait first
+    if target_dt:
+        print(f"\n[CRON SCHEDULER] Listening engaged. Waiting for scheduled start time...")
+        try:
+            while True:
+                now = datetime.now()
+                remaining = (target_dt - now).total_seconds()
+                if remaining <= 0:
+                    break
+
+                mins, secs = divmod(int(remaining), 60)
+                hours, mins = divmod(mins, 60)
+                countdown_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+                sys.stdout.write(
+                    f"\r>> [WAITING TO START] Target: {target_dt.strftime('%I:%M:%S %p')} | "
+                    f"Now: {now.strftime('%H:%M:%S')} | "
+                    f"T-minus: {countdown_str}   "
+                )
+                sys.stdout.flush()
+                time.sleep(min(1.0, max(0.1, remaining)))
+
+            print(f"\n\n>> [TARGET REACHED @ {datetime.now().strftime('%I:%M:%S %p')}] Initiating automated cycle!")
+        except KeyboardInterrupt:
+            print("\n[CRON SCHEDULER] Cancelled by user.")
+            return
+
+    cycle_count = 0
+    try:
+        while True:
+            cycle_count += 1
+            now_str = datetime.now().strftime("%I:%M:%S %p")
+            print("\n" + "#" * 76)
+            print(f"  [CYCLE #{cycle_count}] STARTING AT {now_str}")
+            print("#" * 76)
+
+            # PHASE 1: WAKE UP SERVER & WEB
+            print(f"\n--- [PHASE 1: WAKING UP SERVICES] ---")
+            wake_success = wake_up_server(
+                wake_url=wake_url,
+                timeout_seconds=45.0,
+                auto_start_local=auto_start_local,
+                silent=False,
+            )
+            if not wake_success:
+                print("  [ERROR] Failed to wake up server. Retrying in 10s...")
+                time.sleep(10)
+                continue
+
+            time.sleep(1.0)
+
+            # PHASE 2: RUN THE QUEUE FOR 2 MINUTES
+            print(f"\n--- [PHASE 2: RUNNING QUEUE FOR {run_duration_sec:.0f}s ({run_duration_sec/60:.1f} MIN)] ---")
+            trigger_scheduled_action(action="start-sim", speed=speed, start_sim_url=start_sim_url)
+
+            queue_start_time = time.time()
+            last_report_time = 0.0
+
+            while True:
+                elapsed = time.time() - queue_start_time
+                if elapsed >= run_duration_sec:
+                    break
+
+                remaining_queue_sec = int(run_duration_sec - elapsed)
+                m, s = divmod(remaining_queue_sec, 60)
+
+                # Fetch telemetry every 3 seconds
+                if time.time() - last_report_time >= 3.0:
+                    last_report_time = time.time()
+                    try:
+                        with httpx.Client(timeout=2.0) as client:
+                            st = client.get(stats_url).json()
+                            sim = client.get(sim_url).json()
+                            q = client.get(queue_url).json()
+
+                        sys.stdout.write(
+                            f"\r  >> [ACTIVE: {m:02d}:{s:02d} left] "
+                            f"Clock: {sim.get('sim_clock', '00:00:00')} ({sim.get('progress_percent', 0)}%) | "
+                            f"Dispatched: {st.get('total_tasks_processed', 0)} | "
+                            f"P: {st.get('present_count', 0)} L: {st.get('late_count', 0)} | "
+                            f"Queue buffer: {q.get('queue_depth', 0)}   "
+                        )
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+
+                time.sleep(1.0)
+
+            print(f"\n\n  [SUCCESS] {run_duration_sec:.0f}s queue processing window complete!")
+            # Final stats check
+            try:
+                execute_cron_check(stats_url=stats_url, sim_url=sim_url, queue_url=queue_url)
+            except Exception:
+                pass
+
+            # PHASE 3: TURN OFF SERVICES
+            print(f"\n--- [PHASE 3: TURNING OFF SERVICES] ---")
+            shut_down_server(base_url=base_url, silent=False)
+
+            if max_cycles and cycle_count >= max_cycles:
+                print(f"\n[COMPLETED] Completed all {max_cycles} requested cycles.")
+                break
+
+            # PHASE 4: SLEEP FOR 3 MINUTES BEFORE REPEATING
+            next_run_dt = datetime.now() + timedelta(seconds=sleep_duration_sec)
+            next_run_str = next_run_dt.strftime("%I:%M:%S %p")
+            print(f"\n--- [PHASE 4: SLEEPING FOR {sleep_duration_sec:.0f}s ({sleep_duration_sec/60:.1f} MIN)] ---")
+            print(f"  Services are OFF. Next cycle (#{cycle_count + 1}) will wake up at: {next_run_str}")
+
+            sleep_start = time.time()
+            while True:
+                elapsed_sleep = time.time() - sleep_start
+                if elapsed_sleep >= sleep_duration_sec:
+                    break
+
+                rem_sleep = int(sleep_duration_sec - elapsed_sleep)
+                sm, ss = divmod(rem_sleep, 60)
+                sys.stdout.write(
+                    f"\r  >> [COOLDOWN SLEEP] Offline | T-minus: {sm:02d}:{ss:02d} until next wake-up...   "
+                )
+                sys.stdout.flush()
+                time.sleep(1.0)
+
+            print(f"\n  [ALARM] Cooldown finished! Repeating cycle...\n")
+
+    except KeyboardInterrupt:
+        print("\n\n[USER STOPPED] Cycle monitoring stopped by user.")
+        shut_down_server(base_url=base_url, silent=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run attendance queue telemetry cron job with server wake-up")
+    parser.add_argument(
+        "--cycle",
+        action="store_true",
+        help="Run automated cycle: Wake server -> Run queue (2m) -> Turn off -> Sleep (3m) -> Repeat",
+    )
+    parser.add_argument(
+        "--run-duration",
+        type=float,
+        default=120.0,
+        help="Duration in seconds to run queue/simulation per cycle (default: 120s = 2 min)",
+    )
+    parser.add_argument(
+        "--sleep-duration",
+        type=float,
+        default=180.0,
+        help="Duration in seconds to turn off and sleep before repeating (default: 180s = 3 min)",
+    )
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Maximum number of cycles to execute (default: infinite)",
+    )
     parser.add_argument(
         "--at",
         type=str,
@@ -425,6 +651,27 @@ if __name__ == "__main__":
     if args.once:
         wake_up_server(wake_url=wake_url, timeout_seconds=args.wake_timeout, auto_start_local=auto_start, silent=False)
         execute_cron_check(stats_url=stats_url, sim_url=sim_url, queue_url=queue_url)
+    elif args.cycle:
+        target_dt = None
+        if args.at is not None:
+            target_dt = parse_target_time(args.at)
+        elif args.in_time is not None:
+            target_dt = parse_relative_time(args.in_time)
+
+        run_wake_queue_cycle(
+            target_dt=target_dt,
+            run_duration_sec=args.run_duration,
+            sleep_duration_sec=args.sleep_duration,
+            speed=args.speed,
+            max_cycles=args.max_cycles,
+            base_url=base,
+            stats_url=stats_url,
+            sim_url=sim_url,
+            queue_url=queue_url,
+            wake_url=wake_url,
+            start_sim_url=start_sim_url,
+            auto_start_local=auto_start,
+        )
     elif args.in_time is not None:
         target_dt = parse_relative_time(args.in_time)
         wait_until_target_time(

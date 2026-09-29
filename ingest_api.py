@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -48,6 +49,12 @@ app = Flask(__name__)
 _server_start_time = time.time()
 _last_wakeup_time = None
 _wakeup_count = 0
+_shutdown_hook = None
+
+
+def set_shutdown_hook(fn):
+    global _shutdown_hook
+    _shutdown_hook = fn
 
 # Cloud Tasks Client singleton
 _tasks_client = None
@@ -1406,6 +1413,25 @@ def wakeup():
         "uptime_seconds": uptime_seconds,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }), 200
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def shutdown():
+    """
+    Shuts down local test ground servers and background workers.
+    """
+    caller = request.headers.get("User-Agent", "cron-job")
+    logger.info(f"Shutdown request received via /api/shutdown from {caller}")
+
+    def _do_shutdown():
+        time.sleep(0.4)
+        if _shutdown_hook:
+            _shutdown_hook()
+        else:
+            os._exit(0)
+
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return jsonify({"status": "SHUTTING_DOWN", "message": "Services stopping..."}), 200
 
 
 @app.route("/api/stats", methods=["GET"])

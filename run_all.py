@@ -16,7 +16,7 @@ import time
 import db
 from emulator_runner import EmulatorManager
 from dispatcher import app as dispatcher_app
-from ingest_api import app as ingest_app
+from ingest_api import app as ingest_app, set_shutdown_hook
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +74,25 @@ def main():
     # 4. Start Serverless Ingest API
     logger.info(f"Starting Serverless Ingest API on port {args.ingest_port}...")
     ingest_server = run_flask_thread(ingest_app, "127.0.0.1", args.ingest_port, "Serverless Ingest API")
+
+    def shutdown_all_services():
+        logger.info("Remote shutdown received: stopping all services...")
+        try:
+            ingest_server.shutdown()
+        except Exception:
+            pass
+        try:
+            dispatcher_server.shutdown()
+        except Exception:
+            pass
+        try:
+            emulator.stop()
+        except Exception:
+            pass
+        logger.info("All local services stopped cleanly via shutdown hook.")
+        os._exit(0)
+
+    set_shutdown_hook(shutdown_all_services)
 
     time.sleep(1.0)
 
